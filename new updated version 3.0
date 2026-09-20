@@ -1,0 +1,241 @@
+#include <BluetoothSerial.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+// ------------------- PIN DEFINITIONS -------------------
+// L298N Motor Driver Pins
+#define ENA 12
+#define IN1 13
+#define IN2 2
+#define IN3 25
+#define IN4 27
+
+// Ultrasonic Sensor Pins
+#define TRIG_PIN 18
+#define ECHO_PIN 19
+
+// TCRT5000 Line Sensors (Analog or Digital pins)
+#define LINE_LEFT_PIN  34
+#define LINE_RIGHT_PIN 35
+
+// Battery Voltage Sense Pin (From LM2596 / Divider)
+#define BATTERY_PIN 36 
+
+// GPS Pins (Serial2)
+#define GPS_RX_PIN 16
+#define GPS_TX_PIN 17
+
+// ------------------- OBJECTS & VARIABLES ----------------
+BluetoothSerial SerialBT;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+enum RobotMode { STOP, PATH_MODE, GPS_MODE };
+RobotMode currentMode = STOP;
+
+// Target GPS Coordinates (Given via Bluetooth)
+double targetLat = 0.0;
+double targetLng = 0.0;
+bool targetReceived = false;
+
+// ------------------- SETUP -----------------------------
+void setup() {
+  Serial.begin(115200);
+  
+  // Bluetooth Setup
+  SerialBT.begin("ESP32_ROBOT"); // Bluetooth device name
+  Serial.println("Bluetooth started. Connect to 'ESP32_ROBOT'");
+
+  // GPS Serial Setup
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  // Motor Pins Setup
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  digitalWrite(ENA, HIGH); // Enable motors
+
+  // Ultrasonic Sensor Setup
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Line Sensor Pins Setup
+  pinMode(LINE_LEFT_PIN, INPUT);
+  pinMode(LINE_RIGHT_PIN, INPUT);
+
+  stopMotors();
+}
+
+// ------------------- MAIN LOOP -------------------------
+void loop() {
+  // Read incoming GPS data
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // Handle Bluetooth Commands
+  checkBluetooth();
+
+  // Safety Check: Check Obstacle
+  float distance = getUltrasonicDistance();
+  if (distance > 0 && distance <= 2.0) { // Stop if within 2 cm
+    stopMotors();
+    SerialBT.println("Alert: Obstacle detected within 2cm! Stopped.");
+    delay(200);
+    return;
+  }
+
+  // Execute current mode
+  if (currentMode == PATH_MODE) {
+    runLineFollower();
+  } else if (currentMode == GPS_MODE) {
+    runGPSNavigation();
+  }
+}
+
+// ------------------- BLUETOOTH CONTROL -----------------
+void checkBluetooth() {
+  if (SerialBT.available()) {
+    String cmd = SerialBT.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd.equalsIgnoreCase("path")) {
+      currentMode = PATH_MODE;
+      SerialBT.println("Mode: Line Following Started.");
+    } 
+    else if (cmd.startsWith("gps")) {
+      // Format: gps <target_latitude>,<target_longitude>
+      // Example: gps 13.0827,80.2707
+      int spaceIdx = cmd.indexOf(' ');
+      int commaIdx = cmd.indexOf(',');
+      
+      if (spaceIdx > 0 && commaIdx > spaceIdx) {
+        String latStr = cmd.substring(spaceIdx + 1, commaIdx);
+        String lngStr = cmd.substring(commaIdx + 1);
+        targetLat = latStr.toDouble();
+        targetLng = lngStr.toDouble();
+        targetReceived = true;
+        currentMode = GPS_MODE;
+        SerialBT.printf("Mode: GPS Navigation. Target: %f, %f\n", targetLat, targetLng);
+      } else {
+        SerialBT.println("Usage: gps <target_latitude>,<target_longitude>");
+      }
+    } 
+    else if (cmd.equalsIgnoreCase("battery")) {
+      sendBatteryStatus();
+    } 
+    else if (cmd.equalsIgnoreCase("stop")) {
+      currentMode = STOP;
+      stopMotors();
+      SerialBT.println("Robot Stopped.");
+    }
+  }
+}
+
+// ------------------- ULTRASONIC SENSOR -----------------
+float getUltrasonicDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
+  if (duration == 0) return 999.0;                // No echo detected
+  return (duration * 0.0343) / 2.0;               // Distance in cm
+}
+
+// ------------------- TCRT5000 LINE FOLLOWING -----------
+void runLineFollower() {
+  // Assuming analog/digital read: Black line gives HIGH or low based on calibration
+  int leftVal = analogRead(LINE_LEFT_PIN);
+  int rightVal = analogRead(LINE_RIGHT_PIN);
+  int threshold = 2000; // Adjust threshold based on surface test
+
+  bool leftOnLine = (leftVal > threshold);
+  bool rightOnLine = (rightVal > threshold);
+
+  if (leftOnLine && rightOnLine) {
+    moveForward();
+  } else if (!leftOnLine && rightOnLine) {
+    turnRight();
+  } else if (leftOnLine && !rightOnLine) {
+    turnLeft();
+  } else {
+    moveForward();
+  }
+}
+
+// ------------------- GPS NAVIGATION --------------------
+void runGPSNavigation() {
+  if (!targetReceived) {
+    SerialBT.println("Waiting for target coordinates...");
+    stopMotors();
+    return;
+  }
+
+  if (gps.location.isValid()) {
+    double currentLat = gps.location.lat();
+    double currentLng = gps.location.lng();
+
+    double distanceToTarget = TinyGPSPlus::distanceBetween(currentLat, currentLng, targetLat, targetLng);
+
+    if (distanceToTarget <= 2.0) { // Target reached within 2 meters
+      stopMotors();
+      currentMode = STOP;
+      SerialBT.println("Target waypoint reached successfully!");
+      return;
+    }
+
+    // Move forward towards the waypoint
+    moveForward();
+  } else {
+    stopMotors();
+    SerialBT.println("Waiting for valid GPS lock...");
+  }
+}
+
+// ------------------- BATTERY MONITORING ----------------
+void sendBatteryStatus() {
+  int rawValue = analogRead(BATTERY_PIN);
+  // ADC reference is 3.3V with 12-bit resolution (0-4095)
+  // Voltage divider calculation (adjust based on your resistor divider)
+  float measuredVoltage = (rawValue / 4095.0) * 3.3 * 4.0; 
+  
+  // 3S Li-ion battery range: ~9.0V (0%) to 12.6V (100%)
+  int percentage = map((int)(measuredVoltage * 10), 90, 126, 0, 100);
+  percentage = constrain(percentage, 0, 100);
+
+  SerialBT.printf("Battery: %.2fV (%d%%)\n", measuredVoltage, percentage);
+}
+
+// ------------------- MOTOR MOVEMENTS -------------------
+void moveForward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
